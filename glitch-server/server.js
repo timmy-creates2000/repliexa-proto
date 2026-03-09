@@ -7,8 +7,10 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// In-memory storage (use Firebase for persistent storage)
+// In-memory storage
 const conversations = new Map();
+// Store user configs: { botToken: { openAiKey, systemPrompt, whatsappToken, phoneNumberId } }
+const userConfigs = new Map();
 
 // Self-ping to keep Render free tier awake (prevents spin-down)
 const SELF_PING_INTERVAL = 10 * 60 * 1000; // 10 minutes (Render spins down after 15 min)
@@ -32,14 +34,53 @@ console.log(`[Keep-Alive] Enabled - pinging every ${SELF_PING_INTERVAL / 60000} 
 app.get('/', (req, res) => {
   res.json({ 
     status: 'Repliexa Webhook Server is running!',
-    timestamp: new Date().toISOString()
+    timestamp: new Date().toISOString(),
+    connectedUsers: userConfigs.size
   });
 });
 
-// Telegram webhook endpoint
-app.post('/webhook/telegram', async (req, res) => {
+// Store user config (called from Flutter app when user connects)
+app.post('/config/telegram', (req, res) => {
+  const { botToken, openAiKey, systemPrompt } = req.body;
+  
+  if (!botToken || !openAiKey) {
+    return res.status(400).json({ success: false, message: 'Missing required fields' });
+  }
+  
+  userConfigs.set(botToken, {
+    openAiKey,
+    systemPrompt: systemPrompt || 'You are a helpful assistant.',
+    type: 'telegram'
+  });
+  
+  console.log(`[Config] Telegram bot registered: ${botToken.substring(0, 10)}...`);
+  res.json({ success: true, message: 'Telegram config saved' });
+});
+
+// Store WhatsApp config
+app.post('/config/whatsapp', (req, res) => {
+  const { phoneNumberId, whatsappToken, openAiKey, systemPrompt } = req.body;
+  
+  if (!phoneNumberId || !whatsappToken || !openAiKey) {
+    return res.status(400).json({ success: false, message: 'Missing required fields' });
+  }
+  
+  userConfigs.set(phoneNumberId, {
+    whatsappToken,
+    openAiKey,
+    systemPrompt: systemPrompt || 'You are a helpful assistant.',
+    type: 'whatsapp'
+  });
+  
+  console.log(`[Config] WhatsApp registered: ${phoneNumberId}`);
+  res.json({ success: true, message: 'WhatsApp config saved' });
+});
+
+// Telegram webhook endpoint (with bot token in URL)
+// Webhook URL format: /webhook/telegram/{botToken}
+app.post('/webhook/telegram/:botToken?', async (req, res) => {
   try {
-    console.log('Telegram webhook received:', JSON.stringify(req.body, null, 2));
+    console.log('Telegram webhook received');
     
     const { message } = req.body;
     if (!message || !message.text) {
@@ -48,14 +89,36 @@ app.post('/webhook/telegram', async (req, res) => {
 
     const chatId = message.chat.id;
     const userMessage = message.text;
-    const botToken = req.headers['x-bot-token'];
-    const openAiKey = req.headers['x-openai-key'];
-    const systemPrompt = req.headers['x-system-prompt'] || 'You are a helpful assistant.';
-
-    if (!botToken || !openAiKey) {
-      console.log('Missing credentials');
+    
+    // Get bot token from URL param or try to find in stored configs
+    let botToken = req.params.botToken;
+    
+    // If no token in URL, try to find by looking through configs
+    if (!botToken) {
+      // Try to match by checking getUpdates or using the stored config
+      // For now, use the first stored telegram config
+      for (const [token, config] of userConfigs.entries()) {
+        if (config.type === 'telegram') {
+          botToken = token;
+          break;
+        }
+      }
+    }
+    
+    if (!botToken) {
+      console.log('No bot token found');
       return res.sendStatus(200);
     }
+
+    // Get stored config
+    const config = userConfigs.get(botToken);
+    if (!config) {
+      console.log('No config found for bot token');
+      return res.sendStatus(200);
+    }
+
+    const openAiKey = config.openAiKey;
+    const systemPrompt = config.systemPrompt;
 
     // Get conversation history
     const conversationKey = `telegram_${chatId}`;
@@ -133,7 +196,7 @@ app.get('/webhook/whatsapp', (req, res) => {
 // WhatsApp webhook endpoint
 app.post('/webhook/whatsapp', async (req, res) => {
   try {
-    console.log('WhatsApp webhook received:', JSON.stringify(req.body, null, 2));
+    console.log('WhatsApp webhook received');
     
     const entry = req.body.entry?.[0];
     const changes = entry?.changes?.[0];
@@ -153,14 +216,17 @@ app.post('/webhook/whatsapp', async (req, res) => {
     }
 
     const phoneNumberId = value.metadata?.phone_number_id;
-    const accessToken = req.headers['x-whatsapp-token'];
-    const openAiKey = req.headers['x-openai-key'];
-    const systemPrompt = req.headers['x-system-prompt'] || 'You are a helpful assistant.';
-
-    if (!accessToken || !openAiKey) {
-      console.log('Missing credentials');
+    
+    // Get stored config
+    const config = userConfigs.get(phoneNumberId);
+    if (!config) {
+      console.log('No config found for phone number ID:', phoneNumberId);
       return res.sendStatus(200);
     }
+
+    const accessToken = config.whatsappToken;
+    const openAiKey = config.openAiKey;
+    const systemPrompt = config.systemPrompt;
 
     // Get conversation history
     const conversationKey = `whatsapp_${from}`;
@@ -250,3 +316,4 @@ app.listen(PORT, () => {
   console.log(`Telegram webhook: POST http://localhost:${PORT}/webhook/telegram`);
   console.log(`WhatsApp webhook: POST http://localhost:${PORT}/webhook/whatsapp`);
 });
+
