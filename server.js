@@ -309,7 +309,7 @@ app.delete('/conversations/:platform/:id', (req, res) => {
 });
 
 // ========== WHATSAPP QR CODE (BAILEYS) ==========
-const { makeWASocket, DisconnectReason, useMultiFileAuthState } = require('@whiskeysockets/baileys');
+const { makeWASocket, DisconnectReason, useMultiFileAuthState } = require('baileys');
 const QRCode = require('qrcode');
 
 // Store Baileys sessions
