@@ -308,6 +308,192 @@ app.delete('/conversations/:platform/:id', (req, res) => {
   res.json({ message: 'Conversation cleared' });
 });
 
+// ========== WHATSAPP QR CODE (BAILEYS) ==========
+const { makeWASocket, DisconnectReason, useMultiFileAuthState } = require('@whiskeysockets/baileys');
+const QRCode = require('qrcode');
+
+// Store Baileys sessions
+const baileysSessions = new Map();
+
+// Start WhatsApp QR session
+app.post('/whatsapp-qr/start', async (req, res) => {
+  const { sessionId, openAiKey, systemPrompt } = req.body;
+  
+  if (!sessionId || !openAiKey) {
+    return res.status(400).json({ success: false, message: 'Missing sessionId or openAiKey' });
+  }
+
+  try {
+    // Create auth state directory for this session
+    const authDir = `/tmp/baileys_auth_${sessionId}`;
+    const { state, saveCreds } = await useMultiFileAuthState(authDir);
+
+    const sock = makeWASocket({
+      auth: state,
+      printQRInTerminal: false,
+    });
+
+    baileysSessions.set(sessionId, {
+      sock,
+      openAiKey,
+      systemPrompt: systemPrompt || 'You are a helpful assistant.',
+      saveCreds
+    });
+
+    // Handle QR code
+    sock.ev.on('connection.update', async (update) => {
+      const { qr, connection, lastDisconnect } = update;
+
+      if (qr) {
+        // Generate QR code data URL
+        const qrDataUrl = await QRCode.toDataURL(qr);
+        
+        // Store QR for retrieval
+        const session = baileysSessions.get(sessionId);
+        if (session) {
+          session.qrCode = qrDataUrl;
+          session.qrText = qr;
+        }
+        
+        console.log(`[WhatsApp QR] Generated for session: ${sessionId}`);
+      }
+
+      if (connection === 'close') {
+        const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
+        console.log(`[WhatsApp QR] Connection closed for ${sessionId}, reconnect: ${shouldReconnect}`);
+        
+        if (!shouldReconnect) {
+          baileysSessions.delete(sessionId);
+        }
+      }
+
+      if (connection === 'open') {
+        console.log(`[WhatsApp QR] Connected for session: ${sessionId}`);
+        const session = baileysSessions.get(sessionId);
+        if (session) {
+          session.connected = true;
+          session.qrCode = null; // Clear QR after connection
+        }
+      }
+    });
+
+    // Handle incoming messages
+    sock.ev.on('messages.upsert', async (m) => {
+      const session = baileysSessions.get(sessionId);
+      if (!session || !session.connected) return;
+
+      const msg = m.messages[0];
+      if (!msg.message || msg.key.fromMe) return;
+
+      const from = msg.key.remoteJid;
+      const messageText = msg.message.conversation || msg.message.extendedTextMessage?.text;
+
+      if (!messageText) return;
+
+      console.log(`[WhatsApp QR] Message from ${from}: ${messageText}`);
+
+      try {
+        // Get conversation history
+        const conversationKey = `whatsappqr_${from}`;
+        let history = conversations.get(conversationKey) || [];
+        history.push({ role: 'user', content: messageText });
+        if (history.length > 10) history = history.slice(-10);
+
+        // Call OpenAI
+        const openAiResponse = await axios.post(
+          'https://api.openai.com/v1/chat/completions',
+          {
+            model: 'gpt-3.5-turbo',
+            messages: [
+              { role: 'system', content: session.systemPrompt },
+              ...history
+            ],
+            max_tokens: 500
+          },
+          {
+            headers: {
+              'Authorization': `Bearer ${session.openAiKey}`,
+              'Content-Type': 'application/json'
+            }
+          }
+        );
+
+        const aiReply = openAiResponse.data.choices[0].message.content;
+        history.push({ role: 'assistant', content: aiReply });
+        conversations.set(conversationKey, history);
+
+        // Send reply
+        await sock.sendMessage(from, { text: aiReply });
+        console.log(`[WhatsApp QR] Reply sent to ${from}`);
+
+      } catch (error) {
+        console.error('[WhatsApp QR] Error:', error.message);
+      }
+    });
+
+    sock.ev.on('creds.update', saveCreds);
+
+    res.json({ success: true, message: 'WhatsApp QR session started' });
+
+  } catch (error) {
+    console.error('[WhatsApp QR] Start error:', error.message);
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// Get QR code
+app.get('/whatsapp-qr/:sessionId', (req, res) => {
+  const { sessionId } = req.params;
+  const session = baileysSessions.get(sessionId);
+
+  if (!session) {
+    return res.status(404).json({ success: false, message: 'Session not found' });
+  }
+
+  if (session.connected) {
+    return res.json({ success: true, connected: true, message: 'Already connected' });
+  }
+
+  if (session.qrCode) {
+    return res.json({ 
+      success: true, 
+      connected: false, 
+      qrCode: session.qrCode,
+      qrText: session.qrText 
+    });
+  }
+
+  return res.json({ success: true, connected: false, message: 'QR code not ready yet' });
+});
+
+// Check connection status
+app.get('/whatsapp-qr/:sessionId/status', (req, res) => {
+  const { sessionId } = req.params;
+  const session = baileysSessions.get(sessionId);
+
+  if (!session) {
+    return res.status(404).json({ success: false, message: 'Session not found' });
+  }
+
+  res.json({ 
+    success: true, 
+    connected: session.connected || false 
+  });
+});
+
+// Disconnect session
+app.post('/whatsapp-qr/:sessionId/disconnect', async (req, res) => {
+  const { sessionId } = req.params;
+  const session = baileysSessions.get(sessionId);
+
+  if (session && session.sock) {
+    await session.sock.logout();
+    baileysSessions.delete(sessionId);
+  }
+
+  res.json({ success: true, message: 'Disconnected' });
+});
+
 // Start server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
@@ -315,4 +501,5 @@ app.listen(PORT, () => {
   console.log(`Health check: http://localhost:${PORT}/`);
   console.log(`Telegram webhook: POST http://localhost:${PORT}/webhook/telegram`);
   console.log(`WhatsApp webhook: POST http://localhost:${PORT}/webhook/whatsapp`);
+  console.log(`WhatsApp QR: POST http://localhost:${PORT}/whatsapp-qr/start`);
 });
