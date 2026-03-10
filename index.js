@@ -88,14 +88,33 @@ app.post('/config/whatsapp', (req, res) => {
     res.json({ success: true, message: 'WhatsApp config saved in-memory' });
 });
 
+app.post('/config/test-openai', async (req, res) => {
+    const { openAiKey } = req.body;
+    if (!openAiKey) {
+        return res.status(400).json({ success: false, message: 'API key is required' });
+    }
+    try {
+        const openai = new OpenAI({ apiKey: openAiKey });
+        // Make a tiny request to verify the key is valid and active
+        await openai.models.list();
+        res.json({ success: true, message: 'Connection successful', model: 'gpt-4o-mini' });
+    } catch (error) {
+        let errorMsg = 'Failed to connect to OpenAI';
+        if (error.status === 401) errorMsg = 'Invalid API Key. Please check your key.';
+        if (error.status === 429) errorMsg = 'Rate limit exceeded or quota exhausted.';
+        res.status(400).json({ success: false, message: errorMsg, details: error.message });
+    }
+});
+
 // ═══════════════════════════════════════════════════════════════
 // TELEGRAM WEBHOOK HANDLER
 // ═══════════════════════════════════════════════════════════════
 
-app.post('/webhook/telegram', async (req, res) => {
+app.post('/webhook/telegram/:botToken', async (req, res) => {
     try {
         const update = req.body;
-        console.log('Telegram webhook received');
+        const botToken = req.params.botToken;
+        console.log('Telegram webhook received for bot');
 
         const message = update.message || update.edited_message;
         if (!message) {
@@ -113,31 +132,39 @@ app.post('/webhook/telegram', async (req, res) => {
             }
         }
 
-        // Try to find user from Firestore
-        let userId = await findUserByTelegramChat(chatId);
-        let configSource = 'firestore';
+        // Try to find user configuration
+        let userId = null;
+        let configSource = 'unknown';
         let userConfig = null;
 
-        if (userId) {
-            userConfig = await getUserConfig(userId);
-        } else {
-            // Fallback: check headers for generic test requests or in-memory map
-            const headerBotToken = req.headers['x-bot-token'];
-            if (headerBotToken && userConfigs.has(headerBotToken)) {
-                userConfig = {
-                    toggleActive: true,
-                    openAiApiKey: req.headers['x-openai-key'] || userConfigs.get(headerBotToken).openAiKey,
-                    systemPrompt: req.headers['x-system-prompt'] || userConfigs.get(headerBotToken).systemPrompt,
-                    telegramBotToken: headerBotToken,
-                    businessName: 'Testing Business'
-                };
-                configSource = 'in-memory/headers';
-                userId = 'test_user';
-            }
+        // 1. Try to find user config from in-memory map (which was set via /config/telegram)
+        if (botToken && userConfigs.has(botToken)) {
+            const memConfig = userConfigs.get(botToken);
+            userConfig = {
+                toggleActive: true,
+                openAiApiKey: memConfig.openAiKey,
+                systemPrompt: memConfig.systemPrompt,
+                telegramBotToken: botToken,
+                businessName: 'Testing Business'
+            };
+            configSource = 'in-memory';
+            userId = 'test_user'; // fallback ID if we can't find real Firestore user
+        }
+
+        // 2. Override with Firestore if available based on bot Token
+        if (hasFirestore()) {
+            try {
+                const userSnapshot = await db.collection('users').where('telegramBotToken', '==', botToken).limit(1).get();
+                if (!userSnapshot.empty) {
+                    userId = userSnapshot.docs[0].id;
+                    userConfig = userSnapshot.docs[0].data();
+                    configSource = 'firestore';
+                }
+            } catch (e) { console.log('Firestore lookup failed for bot token'); }
         }
 
         if (!userConfig || userConfig.toggleActive === false) {
-            console.log('AI is disabled or no user found for chat:', chatId);
+            console.log('AI is disabled or no user config found for token.');
             return res.status(200).send('OK');
         }
 
@@ -202,27 +229,27 @@ app.post('/webhook/whatsapp', async (req, res) => {
         const text = message.text?.body || '';
         const phoneNumberId = value.metadata?.phone_number_id;
 
-        let userId = await findUserByWhatsAppPhone(phoneNumberId);
-        let configSource = 'firestore';
-        let userConfig = null;
+        // 1. Try memory
+        if (phoneNumberId && userConfigs.has(phoneNumberId)) {
+            const memConfig = userConfigs.get(phoneNumberId);
+            userConfig = {
+                toggleActive: true,
+                openAiApiKey: memConfig.openAiKey,
+                systemPrompt: memConfig.systemPrompt,
+                whatsappApiToken: memConfig.whatsappToken,
+                whatsappPhoneNumberId: phoneNumberId,
+                businessName: 'Testing Business'
+            };
+            configSource = 'in-memory';
+            userId = 'test_whatsapp_user';
+        }
 
-        if (userId) {
-            userConfig = await getUserConfig(userId);
-        } else {
-            // Fallback
-            if (phoneNumberId && userConfigs.has(phoneNumberId)) {
-                const memConfig = userConfigs.get(phoneNumberId);
-                userConfig = {
-                    toggleActive: true,
-                    openAiApiKey: memConfig.openAiKey,
-                    systemPrompt: memConfig.systemPrompt,
-                    whatsappApiToken: memConfig.whatsappToken,
-                    whatsappPhoneNumberId: phoneNumberId,
-                    businessName: 'Testing Business'
-                };
-                configSource = 'in-memory';
-                userId = 'test_whatsapp_user';
-            }
+        // 2. Try Firestore
+        let fsUserId = await findUserByWhatsAppPhone(phoneNumberId);
+        if (fsUserId) {
+            userConfig = await getUserConfig(fsUserId);
+            configSource = 'firestore';
+            userId = fsUserId;
         }
 
         if (!userConfig || userConfig.toggleActive === false) {
