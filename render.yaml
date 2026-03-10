@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: repliexa-backend
+    env: node
+    plan: free
+    buildCommand: "npm install"
+    startCommand: "npm start"
+    envVars:
+      - key: PORT
+        value: 10000
+      - key: OPENAI_API_KEY
+        value: "dummy-key-update-me-later"
+      - key: WHATSAPP_VERIFY_TOKEN
+        value: "repliexa_verify_token"
